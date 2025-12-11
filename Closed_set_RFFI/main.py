@@ -1,3 +1,30 @@
+"""
+Main script for closed-set device classification using CSI-based RFFI.
+
+This script implements training and testing of a ResNet neural network for
+device classification based on radio frequency fingerprints extracted from
+5G PUSCH CSI. The method uses CSI obfuscation-inspired features to extract
+device-specific fingerprints that are independent of the wireless channel.
+
+Workflow:
+1. Load CSI dataset and extract RFFI features
+2. Train ResNet classification network
+3. Evaluate on same-day and next-day test sets
+4. Generate confusion matrices and accuracy metrics
+
+This code is a fork of the LoRa RFFI repository:
+https://github.com/gxhen/LoRa_RFFI/tree/main/Closed_set_RFFI
+
+Core Modification: The main modification to the original repository is the implementation
+of the Load5gDataset class in dataset_preparation.py, which loads 5G CSI data and
+extracts CSI obfuscation-inspired RFFI features.
+
+Note: You can modify the simulation code below to either train the NN with 5 or all 6 UEs.
+Also, training is non-deterministic. Multiple training trials can achieve slightly different results.
+
+@author: Based on work by G. Shen et al. (LoRa RFFI), adapted for 5G CSI and CSI obfuscation-inspired features
+"""
+
 import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
@@ -8,54 +35,53 @@ from keras.models import load_model
 from keras.callbacks import EarlyStopping, ReduceLROnPlateau
 from keras.optimizers import RMSprop
 
-from dataset_preparation import awgn, LoadDataset, ChannelIndSpectrogram
+from dataset_preparation import Load5gDataset
 
 from deep_learning_models import classification_net
 from keras.utils import to_categorical
 
+import tensorflow as tf
 
-def train(file_path_in,
-          dev_range=range(0, 30),
-          pkt_range=range(0, 1000)):
+# Set random seeds for reproducibility
+tf.random.set_seed(1)
+np.random.seed(1)
 
+# GPU configuration
+GPU_NUM = 0  # Select which GPU to use
+gpus = tf.config.list_physical_devices('GPU')
+print('Number of GPUs available :', len(gpus))
+if gpus:
+    gpu_num = GPU_NUM
+    try:
+        tf.config.set_visible_devices(gpus[gpu_num], 'GPU')
+        print('Only GPU number', gpu_num, 'used.')
+        tf.config.experimental.set_memory_growth(gpus[gpu_num], True)
+    except RuntimeError as e:
+        print(e)
+
+
+def train(training_csi, training_labels, test_csi, test_labels, epochs=400):
     """
-    train_feature_extractor trains an RFF extractor using triplet loss.
+    Train a ResNet classification network for device classification.
 
-    INPUT:
-        FILE_PATH_IN is the path of training dataset.
+    Parameters:
+        training_csi: Training CSI features (RFFI features)
+        training_labels: Training device class labels
+        test_csi: Validation/test CSI features
+        test_labels: Validation/test device class labels
+        epochs: Maximum number of training epochs (default: 400)
 
-        DEV_RANGE is the label range of LoRa devices to train the RFF extractor.
-
-        PKT_RANGE is the range of packets from each LoRa device to train the RFF extractor.
-
-        SNR_RANGE is the SNR range used in data augmentation.
-
-    RETURN:
-        MODEL is trained classification neural network.
+    Returns:
+        model: Trained classification neural network
     """
-
-    # Load preamble IQ samples and labels.
-    LoadDatasetObj = LoadDataset()
-    data_train, label_train = LoadDatasetObj.load_iq_samples(file_path=file_path_in,
-                                                             dev_range=dev_range,
-                                                             pkt_range=pkt_range)
-
-    # Shuffle the training data and labels.
-    index = np.arange(len(label_train))
-    np.random.shuffle(index)
-    data_train = data_train[index, :]
-    label_train = label_train[index]
 
     # One-hot encoding
-    label_train = label_train - dev_range[0]
+    label_train = training_labels
     label_one_hot = to_categorical(label_train)
 
-    # Add noise to increase system robustness
-    data_train = awgn(data_train, range(20, 80))
+    label_validate_one_hot = to_categorical(test_labels)
 
-    # Convert to channel independent spectrogram
-    ChannelIndSpectrogramObj = ChannelIndSpectrogram()
-    data = ChannelIndSpectrogramObj.channel_ind_spectrogram(data_train)
+    data = training_csi
 
     # Learning rate scheduler
     early_stop = EarlyStopping('val_loss', min_delta=0, patience=30)
@@ -70,9 +96,9 @@ def train(file_path_in,
     # Start training
     history = model.fit(data,
                         label_one_hot,
-                        epochs=400,
+                        epochs=epochs,
                         shuffle=True,
-                        validation_split=0.10,
+                        validation_data=(test_csi, label_validate_one_hot),
                         verbose=1,
                         batch_size=32,
                         callbacks=callbacks)
@@ -80,42 +106,28 @@ def train(file_path_in,
     return model
 
 
-def test(file_path_in,
-         clf_path_in,
-         dev_range=np.arange(0, 30),
-         pkt_range=np.arange(0, 400)):
-
+def test(clf_path_in, result_path, test_csi, test_labels, label_list):
     """
-    test_classification performs a classification task and returns the
-    classification accuracy.
+    Test the trained classification network and generate evaluation metrics.
 
-    INPUT:
-        FILE_PATH_IN is the path of enrollment dataset.
+    Parameters:
+        clf_path_in: Path to saved trained model
+        result_path: Path prefix for saving results (confusion matrix plots and data)
+        test_csi: Test CSI features
+        test_labels: True device class labels for test set
+        label_list: List of device class names for plotting
 
-        CLF_PATH_IN is the path of classification dataset.
-
-        DEV_RANGE is the label range of LoRa devices.
-
-        PKT_RANGE is the range of packets from each LoRa device.
-
-    RETURN:
-        ACC is the overall classification accuracy.
+    Returns:
+        acc: Overall classification accuracy
     """
 
-    # Load preamble IQ samples and labels.
-    LoadDatasetObj = LoadDataset()
-    data_test, label_test = LoadDatasetObj.load_iq_samples(file_path=file_path_in,
-                                                           dev_range=dev_range,
-                                                           pkt_range=pkt_range)
-
-    label_test = label_test - dev_range[0]
+    label_test = test_labels
 
     # Load neural network
     net_test = load_model(clf_path_in, compile=False)
 
     # Convert to channel independent spectrogram
-    ChannelIndSpectrogramObj = ChannelIndSpectrogram()
-    data = ChannelIndSpectrogramObj.channel_ind_spectrogram(data_test)
+    data = test_csi
 
     # Make prediction
     pred_prob = net_test.predict(data)
@@ -123,7 +135,7 @@ def test(file_path_in,
 
     # Plot confusion matrix
     conf_mat = confusion_matrix(label_test, pred_label)
-    classes = dev_range - dev_range[0] + 1
+    classes = label_list
 
     plt.figure()
     sns.heatmap(conf_mat, annot=True,
@@ -135,29 +147,99 @@ def test(file_path_in,
 
     plt.xlabel('Predicted label', fontsize=12)
     plt.ylabel('True label', fontsize=12)
-    plt.savefig('confusion_matrix.pdf', bbox_inches='tight')
+    # result_path = "./results/confusion_matrix_no_random_subsampling10"
+    plt.savefig(result_path+'.pdf', bbox_inches='tight')
     plt.show()
 
+    rows, cols = conf_mat.shape
+    with open(result_path + ".dat", "w") as f:
+        # f.write("x y C\n")  # header
+        for y in range(rows):
+            for x in range(cols):
+                f.write(f"{x} {y} {conf_mat[y, x]:.5f}\n")
+    # np.savetxt(result_path + ".csv", conf_mat, delimiter=",")
+    
     return accuracy_score(label_test, pred_label)
 
 
 if __name__ == '__main__':
+    # Configuration parameters
+    experiment_name = '5_ues_complex_features_val_middle_4oru_2025_11_15_1_test'
+    feature_type = 'obfuscation'  # Feature extraction type: 'obfuscation' or 'ofdm_absolutes'
+    random_subsampling = False
+    take_middle = True  # Take middle samples for validation set
+    test_to_all_ratio = 0.125  # Fraction of samples used for same-day testing (12.5%)
+    file_path = '/scratch/rwiesmayr/csi_data/device_classification_2025_11_15'
+    # uncomment this to train on all 6 UEs
+    # label_list_training = ["iPhone14Pro_gold", "iPhone14Pro_black", "iPhone16e", "OnePlusNord", "sgs23", "pixel7"]
+    # train only on 5 UEs
+    label_list_training = ["iPhone14Pro_gold", "iPhone16e", "OnePlusNord", "sgs23", "pixel7"]
+    clf_path = f'/scratch/rwiesmayr/results/weights/cnn_subsampling_{random_subsampling}_features_{feature_type}_{experiment_name}.weight'
+    results_path = f'/scratch/rwiesmayr/results/device_classification/confusion_matrix_{random_subsampling}_features_{feature_type}_{experiment_name}'
+    n_orus = 4  # Number of O-RUs (access points)
 
-    # run_for = 'train'
-    run_for = 'test'
+    # Load dataset and extract features
+    LoadDatasetObj = Load5gDataset(feature_type=feature_type)
+    training_csi, training_labels, test_csi, test_labels = \
+         LoadDatasetObj.load_channel_estimates(file_path=file_path+"/training", 
+                                               label_list=label_list_training,
+                                               random_subsampling=random_subsampling,
+                                               n_orus=n_orus,
+                                               test_to_all_ratio=test_to_all_ratio,
+                                               take_middle=take_middle)
+    
+    # Train classification network
+    clf_net = train(training_csi, training_labels, test_csi, test_labels)
+    clf_net.save(clf_path)
 
-    if run_for == 'train':
+    # if random_subsampling==False:
+    #     label_list_testing = ["iphone14pro_gold", "iphone16e", "oneplusNord_eth", "sgs23", "googlePixel7"] # ["iphone14pro_gold", "iphone15pro", "iphone16e", "oneplusNord_eth", "sgs23", "googlePixel7", "iphone14pro_black",  "iPhone15Pro_2nd_measurement", "iPhone15Pro_3rd_measurement_monday", "sgs23_monday_uestand"]
+    #     training_csi, training_labels, test_csi, test_labels = \
+    #         LoadDatasetObj.load_channel_estimates(file_path=file_path, 
+    #                                             label_list=label_list_testing,
+    #                                             random_subsampling=False,
+    #                                             n_orus=n_orus,
+    #                                             test_to_all_ratio=0.25)
+    
+    # Evaluate on same-day test set
+    label_list_testing_plot = label_list_training
+    acc = test(clf_path, results_path, test_csi, test_labels, label_list_testing_plot)
+    print('Overall accuracy (same day, 5) = %.4f' % acc)
 
-        file_path = './Train/dataset_training_aug.h5'
+    # Load next-day test set and evaluate
+    _, _, test_csi, test_labels = \
+         LoadDatasetObj.load_channel_estimates(file_path=file_path+"/testing", 
+                                               label_list=label_list_training,
+                                               random_subsampling=random_subsampling,
+                                               n_orus=n_orus,
+                                               test_to_all_ratio=1.0,
+                                               take_middle=take_middle)
+    
+    acc = test(clf_path, results_path+"_next_day", test_csi, test_labels, label_list_testing_plot)
+    print('Overall accuracy (next day, 5) = %.4f' % acc)
 
-        clf_net = train(file_path)
+    # label_list_training = ["iPhone14Pro_gold", "iPhone16e", "OnePlusNord", "sgs23", "pixel7"] # "iPhone14Pro_black"
+    label_list_testing6 = ["iPhone14Pro_gold", "iPhone16e", "OnePlusNord", "sgs23", "pixel7", "iPhone14Pro_black"]
+    _, _, test_csi, test_labels = \
+         LoadDatasetObj.load_channel_estimates(file_path=file_path+"/testing", 
+                                               label_list=label_list_testing6,
+                                               random_subsampling=random_subsampling,
+                                               n_orus=n_orus,
+                                               test_to_all_ratio=1.0,
+                                               take_middle=take_middle)
+    
+    acc = test(clf_path, results_path+"_next_day_6", test_csi, test_labels, label_list_testing6)
+    print('Overall accuracy (next day, 6) = %.4f' % acc)
 
-        clf_net.save('cnn.h5')
-
-    elif run_for == 'test':
-
-        file_path = './Test/dataset_seen_devices.h5'
-        clf_path = 'cnn.h5'
-
-        acc = test(file_path, clf_path)
-        print('Overall accuracy = %.4f' % acc)
+    # label_list_training = ["iPhone14Pro_gold", "iPhone16e", "OnePlusNord", "sgs23", "pixel7"] # "iPhone14Pro_black"
+    # label_list_testing5 = ["iPhone14Pro_gold", "iPhone16e", "OnePlusNord", "sgs23", "pixel7", "iPhone14Pro_black"]
+    # _, _, test_csi, test_labels = \
+    #      LoadDatasetObj.load_channel_estimates(file_path=file_path+"/training", 
+    #                                            label_list=label_list_testing5,
+    #                                            random_subsampling=random_subsampling,
+    #                                            n_orus=n_orus,
+    #                                            test_to_all_ratio=test_to_all_ratio,
+    #                                            take_middle=take_middle)
+    
+    # acc = test(clf_path, results_path+"_same_day_6", test_csi, test_labels, label_list_testing5)
+    # print('Overall accuracy (same day, 6) = %.4f' % acc)

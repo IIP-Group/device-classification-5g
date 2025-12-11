@@ -1,173 +1,159 @@
 import numpy as np
+import cupy as cp
 import h5py
 from numpy import sum, sqrt
 from numpy.random import standard_normal, uniform
 
 from scipy import signal
+import os
+from tqdm import tqdm
+from contextlib import contextmanager
+import pickle
 
-# In[]
+@contextmanager
+def opened_w_error(filename, mode="r"):
+    try:
+        f = open(filename, mode)
+    except IOError as err:
+        yield None, err
+    else:
+        try:
+            yield f, None
+        finally:
+            f.close()
 
-def awgn(data, snr_range):
-    pkt_num = data.shape[0]
-    SNRdB = uniform(snr_range[0], snr_range[-1], pkt_num)
-    for pktIdx in range(pkt_num):
-        s = data[pktIdx]
-        # SNRdB = uniform(snr_range[0],snr_range[-1])
-        SNR_linear = 10 ** (SNRdB[pktIdx] / 10)
-        P = sum(abs(s) ** 2) / len(s)
-        N0 = P / SNR_linear
-        n = sqrt(N0 / 2) * (standard_normal(len(s)) + 1j * standard_normal(len(s)))
-        data[pktIdx] = s + n
-
-    return data
-
-
-class LoadDataset():
-    def __init__(self, ):
+class Load5gDataset():
+    def __init__(self, feature_type='ofdm_absolutes'):
         self.dataset_name = 'data'
         self.labelset_name = 'label'
+        assert feature_type in ['ofdm_absolutes', 'obfuscation']
+        self.feature_type = feature_type
 
-    def _convert_to_complex(self, data):
-        '''Convert the loaded data to complex IQ samples.'''
-        num_row = data.shape[0]
-        num_col = data.shape[1]
-        data_complex = np.zeros([num_row, round(num_col / 2)], dtype=complex)
+    def load_channel_estimates(self, file_path, label_list=[], test_to_all_ratio=0.2, n_prbs=273, n_orus=1, n_rx_ant_per_oru = 4, n_tx_ant=1, n_dmrs_symbols = 3, random_subsampling=True, take_middle=False):
+        test_csi_list = []
+        test_label_list = []
+        training_csi_list = []
+        training_label_list = []
+        for label_idx, label in enumerate(label_list):
+            print("Load data for " + label)
+            data_path = os.path.join(file_path, label)
+            data_files = [f for f in os.listdir(data_path) if os.path.isfile(os.path.join(data_path, f)) and ".pickle" in f]
+            n_data_samples = len(data_files)
+            H = np.zeros((n_data_samples, n_orus, n_rx_ant_per_oru, n_tx_ant, n_prbs*12, n_dmrs_symbols), dtype=np.complex64)
+            noise_var = np.zeros((n_data_samples,n_orus), dtype=np.float32)
+            sample_timestamps = np.zeros((n_data_samples), dtype=np.float64)
 
-        data_complex = data[:, :round(num_col / 2)] + 1j * data[:, round(num_col / 2):]
-        return data_complex
+            print("Processing CSI estimates")
 
-    def load_iq_samples(self, file_path, dev_range, pkt_range):
-        '''
-        Load IQ samples from a dataset.
+            t = tqdm(total=n_data_samples)
+            # read in all pickle files and store data to associated variables
+            for idx, data_file in enumerate(data_files):
+                t.update()  
+                with opened_w_error(os.path.join(data_path, data_file), "rb") as (file, err):
+                    if err:
+                        print("File " + data_file + " has IO Error: " + str(err))
+                    else:
+                        x = pickle.load(file)
+                        # h_sample = x['ch_est']
+                        h_sample = x['ch_est'] # N_ORU x Rx ant x layer x frequency x time
+                        H[idx, :, :, :, :, :] = np.squeeze(np.array(h_sample), axis=1)    # np.array should make a copy, slice assignment should also do the copy on itself
+                        # H[idx, :, :, :, :, :] = np.take(np.squeeze(np.array(h_sample), axis=1), indices=[0,2], axis=0)    
+                        # noise_var[idx, 0] = x['noise_var_dB'][0] # @TODO: here is a bug in the PyAerial Notebook! It should be the noise var from two O-RUs
+                        noise_var[idx, :] = np.squeeze(np.array(x['noise_var_dB']))
+                        # noise_var[idx, :] = np.take(np.squeeze(np.array(x['noise_var_dB'])), indices=[0,2], axis=0)    
+                        # we also have in x the keys 'start_prb', 'num_prbs' but we use all 273 PRBs all of the times
 
-        INPUT:
-            FILE_PATH is the dataset path.
+                        timestamp_str = data_file.split("_")[0]
+                        timestamp = np.fromstring(timestamp_str, dtype=np.float64, sep='.')
+                        sample_timestamps[idx] = timestamp[0]
+            
+            # compute features
+            if self.feature_type == 'ofdm_absolutes':
+                print(f"Computing mean absolutes over N_tx={n_tx_ant} and all {n_dmrs_symbols} DMRS symbols")
+                H = np.mean(np.abs(H), axis=(3,5))
 
-            DEV_RANGE specifies the loaded device range.
+                print("Normalize per AP")
+                H = H / np.linalg.norm(H, ord="fro", axis=(2,3), keepdims=True)
 
-            PKT_RANGE specifies the loaded packets range.
+                print("Stack APs for each CSI sample")
+                H = np.reshape(H, [n_data_samples, -1, n_prbs*12, 1])
 
-        RETURN:
-            DATA is the laoded complex IQ samples.
+                features = H
 
-            LABLE is the true label of each received packet.
-        '''
+            elif self.feature_type == 'obfuscation':
+                # H is [n_data_samples, n_orus, n_rx_ant_per_oru, n_tx_ant, n_prbs*12, n_dmrs_symbols]
+                H_ = np.transpose(H, [0,3,4,5,1,2])
+                # H_ is [n_data_samples, n_tx_ant, n_prbs*12, n_dmrs_symbols, n_orus, n_rx_ant_per_oru]
+                H_ = np.reshape(H_, [n_data_samples, n_tx_ant*n_prbs*12*n_dmrs_symbols, -1 ])
+                # H_ is [n_data_samples, n_tx_ant * n_prbs * 12 * n_dmrs_symbols, n_orus * n_rx_ant_per_oru]
 
-        f = h5py.File(file_path, 'r')
-        label = f[self.labelset_name][:]
-        label = label.astype(int)
-        label = np.transpose(label)
-        label = label - 1
+                # H_ = np.abs(H_)
 
-        label_start = int(label[0]) + 1
-        label_end = int(label[-1]) + 1
-        num_dev = label_end - label_start + 1
-        num_pkt = len(label)
-        num_pkt_per_dev = int(num_pkt / num_dev)
+                print('Normalize each channel vector')
+                H_ = H_ / np.linalg.norm(H_, axis=-1, keepdims=True)
 
-        print('Dataset information: Dev ' + str(label_start) + ' to Dev ' +
-              str(label_end) + ', ' + str(num_pkt_per_dev) + ' packets per device.')
+                # # Gram and Eigh (for eigenvalue decomposition, computationally more intensive than SVD)
+                # R_hat = H_ @ H_.H
+                # r_eigenvalues, r_eigenvectors = np.linalg.eigh(R_hat)
 
-        sample_index_list = []
+                print("Compute SVD")
+                #U, S, Vh = np.linalg.svd(H_, full_matrices=False, compute_uv=True, hermitian=False)
+                U, S, Vh = cp.linalg.svd(cp.array(H_), full_matrices=False, compute_uv=True)
 
-        for dev_idx in dev_range:
-            sample_index_dev = np.where(label == dev_idx)[0][pkt_range].tolist()
-            sample_index_list.extend(sample_index_dev)
+                principal_singular_vector = np.take(U.get(), indices=0, axis=-1)
 
-        data = f[self.dataset_name][sample_index_list]
-        data = self._convert_to_complex(data)
+                print("Stack real and imaginary part in last dimension")
+                features = np.expand_dims(principal_singular_vector, axis=-1)
+                features = np.concatenate([np.real(features),np.imag(features)], axis=-1)
+                # principal_singular_vector is [n_data_samples, n_tx_ant * n_prbs * 12 * n_dmrs_symbols * 2]
+                features = np.reshape(features, [n_data_samples, n_tx_ant * n_prbs * 12, n_dmrs_symbols, 2])
 
-        label = label[sample_index_list]
+            mempool = cp.get_default_memory_pool()
+            mempool.free_all_blocks()
 
-        f.close()
-        return data, label
+            if random_subsampling:
+                print("Randomly shuffle samples")
+                np.random.shuffle(features)
+            else:
+                print("Sort samples according to timestamps")
+                time_asc_idx = np.argsort(sample_timestamps)
+                features = np.take(features, time_asc_idx, axis=0)
 
+            n_test = round(n_data_samples * test_to_all_ratio)
+            n_training = n_data_samples - n_test
 
-class ChannelIndSpectrogram():
-    def __init__(self, ):
-        pass
+            print(f"Append CSI samples from {label} to list")
+            if take_middle:
+                val_idx = np.arange(n_data_samples//2 - int(np.floor(n_test/2)), n_data_samples//2 + int(np.ceil(n_test/2)))
+                tr_idx = np.delete(np.arange(n_data_samples), val_idx)
+            else:
+                tr_idx = np.arange(0,n_training)
+                val_idx = np.arange(n_training,n_data_samples)
+            assert np.size(val_idx) == n_test and np.size(tr_idx) == n_training
+            training_csi_list.append(np.take(features, indices=tr_idx, axis=0))
+            test_csi_list.append(np.take(features, indices=val_idx, axis=0))
+            test_label_list.append([label_idx]*n_test)
+            training_label_list.append([label_idx]*n_training)
 
-    def _normalization(self, data):
-        ''' Normalize the signal.'''
-        s_norm = np.zeros(data.shape, dtype=complex)
+        print("Concatenate all classes")
+        training_csi = np.concatenate(training_csi_list)
+        training_labels = np.concatenate(training_label_list)
+        test_csi = np.concatenate(test_csi_list)
+        test_labels = np.concatenate(test_label_list)
 
-        for i in range(data.shape[0]):
-            sig_amplitude = np.abs(data[i])
-            rms = np.sqrt(np.mean(sig_amplitude ** 2))
-            s_norm[i] = data[i] / rms
+        print("Shuffle training data set")
+        training_perm_idx = np.arange(np.shape(training_csi)[0])
+        np.random.shuffle(training_perm_idx)
+        training_csi = np.take(training_csi, indices=training_perm_idx, axis=0)
+        training_labels = np.take(training_labels, indices=training_perm_idx, axis=0)
 
-        return s_norm
+        print("Shuffle test data set")
+        test_perm_idx = np.arange(np.shape(test_csi)[0])
+        np.random.shuffle(test_perm_idx)
+        test_csi = np.take(test_csi, indices=test_perm_idx, axis=0)
+        test_labels = np.take(test_labels, indices=test_perm_idx, axis=0)
 
-    def _spec_crop(self, x):
-        '''Crop the generated channel independent spectrogram.'''
-        num_row = x.shape[0]
-        x_cropped = x[round(num_row * 0.3):round(num_row * 0.7)]
+        return [training_csi, training_labels, test_csi, test_labels]
 
-        return x_cropped
-
-    def _gen_single_channel_ind_spectrogram(self, sig, win_len=256, overlap=128):
-        '''
-        _gen_single_channel_ind_spectrogram converts the IQ samples to a channel
-        independent spectrogram according to set window and overlap length.
-
-        INPUT:
-            SIG is the complex IQ samples.
-
-            WIN_LEN is the window length used in STFT.
-
-            OVERLAP is the overlap length used in STFT.
-
-        RETURN:
-
-            CHAN_IND_SPEC_AMP is the genereated channel independent spectrogram.
-        '''
-        # Short-time Fourier transform (STFT).
-        f, t, spec = signal.stft(sig,
-                                 window='boxcar',
-                                 nperseg=win_len,
-                                 noverlap=overlap,
-                                 nfft=win_len,
-                                 return_onesided=False,
-                                 padded=False,
-                                 boundary=None)
-
-        # FFT shift to adjust the central frequency.
-        spec = np.fft.fftshift(spec, axes=0)
-
-        # Generate channel independent spectrogram.
-        chan_ind_spec = spec[:, 1:] / spec[:, :-1]
-
-        # Take the logarithm of the magnitude.
-        chan_ind_spec_amp = np.log10(np.abs(chan_ind_spec) ** 2)
-
-        return chan_ind_spec_amp
-
-    def channel_ind_spectrogram(self, data):
-        '''
-        channel_ind_spectrogram converts IQ samples to channel independent
-        spectrograms.
-
-        INPUT:
-            DATA is the IQ samples.
-
-        RETURN:
-            DATA_CHANNEL_IND_SPEC is channel independent spectrograms.
-        '''
-
-        # Normalize the IQ samples.
-        data = self._normalization(data)
-
-        # Calculate the size of channel independent spectrograms.
-        num_sample = data.shape[0]
-        num_row = int(256 * 0.4)
-        num_column = int(np.floor((data.shape[1] - 256) / 128 + 1) - 1)
-        data_channel_ind_spec = np.zeros([num_sample, num_row, num_column, 1])
-
-        # Convert each packet (IQ samples) to a channel independent spectrogram.
-        for i in range(num_sample):
-            chan_ind_spec_amp = self._gen_single_channel_ind_spectrogram(data[i])
-            chan_ind_spec_amp = self._spec_crop(chan_ind_spec_amp)
-            data_channel_ind_spec[i, :, :, 0] = chan_ind_spec_amp
-
-        return data_channel_ind_spec
+        
 

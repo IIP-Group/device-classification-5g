@@ -37,7 +37,7 @@ def resblock(x, kernelsize, filters, first_layer=False):
 def classification_net(datashape, num_classes):
     datashape = datashape
 
-    inputs = Input(shape=(np.append(datashape[1:-1], 1)))
+    inputs = Input(shape=datashape[1:])
 
     x = Conv2D(32, 7, strides=2, activation='relu', padding='same')(inputs)
 
