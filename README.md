@@ -91,4 +91,4 @@ If you use this code (or parts of it), then you must cite references [1] and [3]
 
 [2] P. Stephan, F. Euchner, and S. ten Brink, "CSI obfuscation: Single-antenna transmitters can not hide from adversarial multi-antenna radio localization systems," in *Proc. Int'l Workshop Smart Antennas (WSA)*, 2025.
 
-[3] R. Wiesmayr, F. Zumegen, S. Taner, C. Dick, and C. Studer, "CSI-based user positioning, channel charting, and device classification with an NVIDIA 5G testbed," in *Asilomar Conf. Signals, Syst., Comput.*, Oct. 2025.
+[3] R. Wiesmayr, F. Zumegen, S. Taner, C. Dick, and C. Studer, "CSI-based user positioning, channel charting, and device classification with an NVIDIA 5G testbed," in *Asilomar Conf. Signals, Syst., Comput.*, Oct. 2025, arXiv preprint https://arxiv.org/abs/2512.10809
